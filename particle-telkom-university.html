@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultimate Gesture Particles</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', sans-serif; }
+        
+        /* Wadah Kamera Kecil (Debug) */
+        .cam-container {
+            position: absolute; bottom: 20px; left: 20px;
+            width: 150px; height: 112px;
+            border: 2px solid #00ffff; border-radius: 12px;
+            background: #000; overflow: hidden; z-index: 100;
+            box-shadow: 0 0 15px rgba(0, 255, 255, 0.3);
+        }
+        #output_canvas { width: 100%; height: 100%; transform: scaleX(-1); }
+        #input_video { display: none; }
+
+        /* UI Status Text */
+        #ui-layer {
+            position: absolute; top: 30px; left: 30px; pointer-events: none; z-index: 50;
+        }
+        h1 {
+            color: #00ffff; font-size: 28px; margin: 0;
+            text-shadow: 0 0 10px rgba(0, 255, 255, 0.6);
+            letter-spacing: 1px;
+        }
+        p { color: #ccc; margin-top: 5px; font-size: 16px; opacity: 0.90; }
+
+        /* Loading Screen */
+        #loader {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(10, 10, 10, 0.9);
+            padding: 25px 50px; border-radius: 15px; border: 1px solid #333;
+            color: #fff; text-align: center; font-size: 18px;
+            box-shadow: 0 0 30px rgba(0,0,0,0.8);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="cam-container">
+        <video id="input_video" playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <div id="ui-layer">
+        <h1 id="status-title">System Initializing...</h1>
+        <p id="status-desc">Mohon izinkan akses kamera.</p>
+    </div>
+
+    <div id="loader">Memuat AI Vision & High-Res Particles...</div>
+
+    <script src="https://unpkg.com/three@0.146.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+    <script>
+        // --- KONFIGURASI TINGKAT LANJUT ---
+        const CONFIG = {
+            particleCount: 18000,    // Kepadatan tinggi agar tulisan tidak bolong
+            particleSize: 0.11,      // Ukuran pas, tidak terlalu besar/kecil
+            canvasRes: 512,          // Resolusi sampling tinggi (HD) agar teks tidak kotak-kotak
+            baseColor: new THREE.Color('#00dbff'),
+            logoURL: 'https://upload.wikimedia.org/wikipedia/commons/0/03/Logo_Telkom_University_potrait.png',
+            
+            // Pengaturan Zoom (Min = Jauh/Rapat, Max = Dekat/Besar)
+            zoomMin: 0.85, 
+            zoomMax: 1.4,
+            
+            // Kecepatan Morphing (Perubahan Bentuk)
+            morphSpeed: 0.07 
+        };
+
+        // --- GLOBAL STATE ---
+        let scene, camera, renderer, particleSystem;
+        let positions, colors, targetPositions, targetColors;
+        
+        // Hand State
+        let isHandDetected = false;
+        let currentGesture = -1; 
+        let handCentroid = { x: 0.5, y: 0.5 };
+        let smoothHandSize = 0.2; // Nilai awal rata-rata ukuran tangan
+
+        // DOM Elements
+        const statusTitle = document.getElementById('status-title');
+        const statusDesc = document.getElementById('status-desc');
+        const loader = document.getElementById('loader');
+
+        // Helper Canvas (Offscreen)
+        const helperCanvas = document.createElement('canvas');
+        const ctx = helperCanvas.getContext('2d', { willReadFrequently: true });
+        helperCanvas.width = CONFIG.canvasRes; 
+        helperCanvas.height = CONFIG.canvasRes;
+
+
+        // ============================================
+        // 1. ENGINE 3D (THREE.JS)
+        // ============================================
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x050505, 0.025); // Fog hitam elegan
+
+            // Kamera dimundurkan sedikit (Z=18) agar teks panjang muat sempurna
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.z = 18; 
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            // Setup Buffer Geometri
+            const count = CONFIG.particleCount;
+            positions = new Float32Array(count * 3);
+            colors = new Float32Array(count * 3);
+            targetPositions = new Float32Array(count * 3);
+            targetColors = new Float32Array(count * 3);
+
+            // Inisialisasi awal: Bentuk Bola
+            calculateSphereTarget();
+            
+            // Set posisi awal = target awal
+            for(let i=0; i<count*3; i++) {
+                positions[i] = targetPositions[i];
+                colors[i] = targetColors[i];
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            // Material
+            const texture = new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/disc.png');
+            const material = new THREE.PointsMaterial({
+                size: CONFIG.particleSize,
+                map: texture,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.90,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending
+            });
+
+            particleSystem = new THREE.Points(geometry, material);
+            scene.add(particleSystem);
+
+            // Resize Handler
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+
+        // ============================================
+        // 2. LOGIKA PEMBENTUKAN (SHAPE LOGIC)
+        // ============================================
+
+        // --- IDLE: SPHERE ---
+        function calculateSphereTarget() {
+            const r = 7; // Radius bola
+            const count = CONFIG.particleCount;
+            for (let i = 0; i < count; i++) {
+                const phi = Math.acos(-1 + (2 * i) / count);
+                const theta = Math.sqrt(count * Math.PI) * phi;
+                
+                targetPositions[i*3] = r * Math.cos(theta) * Math.sin(phi);
+                targetPositions[i*3+1] = r * Math.sin(theta) * Math.sin(phi);
+                targetPositions[i*3+2] = r * Math.cos(phi);
+
+                setColorDefault(i);
+            }
+        }
+
+        // --- GENGGAM: SCATTER (Controlled) ---
+        function calculateScatterTarget() {
+            const count = CONFIG.particleCount;
+            for (let i = 0; i < count; i++) {
+                // Sebar partikel di area luas (radius 15-25)
+                const r = 10 + Math.random() * 2;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos((Math.random() * 2) - 1);
+
+                targetPositions[i*3] = r * Math.sin(phi) * Math.cos(theta);
+                targetPositions[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+                targetPositions[i*3+2] = r * Math.cos(phi);
+
+                targetColors[i*3]   = CONFIG.baseColor.r;     // full cerah
+                targetColors[i*3+1] = CONFIG.baseColor.g;
+                targetColors[i*3+2] = CONFIG.baseColor.b;
+            }
+        }
+
+        // --- TEKS PINTAR (ANTI-POTONG) ---
+        function calculateTextTarget(text, isMultiline) {
+            // Bersihkan Canvas
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, CONFIG.canvasRes, CONFIG.canvasRes);
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+
+            const cx = CONFIG.canvasRes / 2;
+            const cy = CONFIG.canvasRes / 2;
+            
+            // Logika Fitting Font
+            if (isMultiline) {
+                // Pisah kata (misal: "Information" dan "Technology")
+                const words = text.split(' ');
+                const midIndex = Math.ceil(words.length / 2);
+                const line1 = words.slice(0, midIndex).join(' ');
+                const line2 = words.slice(midIndex).join(' ');
+
+                // Font lebih kecil untuk multiline agar muat
+                ctx.font = 'bold 70px Arial'; 
+                ctx.fillText(line1, cx, cy - 50);
+                ctx.fillText(line2, cx, cy + 50);
+            } else {
+                // Single line (I, Love) - Font besar
+                // Jika teks panjang tapi 1 baris, kecilkan font otomatis
+                let fontSize = 180;
+                if(text.length > 2) fontSize = 120; // Kata "Love"
+                
+                ctx.font = `bold ${fontSize}px Arial`;
+                ctx.fillText(text, cx, cy);
+            }
+
+            processCanvasData(false); // False = jangan pakai warna canvas (pakai Cyan)
+        }
+
+        // --- LOGO (GAMBAR) ---
+        let logoCache = null;
+        function calculateImageTarget(url) {
+            if (logoCache) {
+                renderLogoToCanvas(logoCache);
+            } else {
+                const img = new Image();
+                img.crossOrigin = "Anonymous";
+                img.onload = () => {
+                    logoCache = img;
+                    renderLogoToCanvas(img);
+                };
+                img.onerror = () => {
+                    calculateTextTarget("Logo Error", false);
+                }
+                img.src = url;
+            }
+        }
+
+        function renderLogoToCanvas(img) {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, CONFIG.canvasRes, CONFIG.canvasRes);
+            
+            // Hitung skala agar muat di dalam canvas dengan padding 10%
+            const padding = CONFIG.canvasRes * 0.1; // 10% padding
+            const availableSize = CONFIG.canvasRes - (padding * 2);
+            
+            const scale = Math.min(availableSize / img.width, availableSize / img.height);
+            const w = img.width * scale;
+            const h = img.height * scale;
+            const x = (CONFIG.canvasRes - w) / 2;
+            const y = (CONFIG.canvasRes - h) / 2;
+
+            ctx.drawImage(img, x, y, w, h);
+            processCanvasData(true); // True = Ambil warna asli logo
+        }
+
+        // --- PROSES PIXEL KE PARTIKEL ---
+        function processCanvasData(useImageColor) {
+            const imageData = ctx.getImageData(0, 0, CONFIG.canvasRes, CONFIG.canvasRes);
+            const data = imageData.data;
+            let validPixels = [];
+
+            // Sampling pixel (step 2 untuk performa, tapi canvasRes tinggi jadi tetap detail)
+            for(let y=0; y < CONFIG.canvasRes; y+=3) {
+                for(let x=0; x < CONFIG.canvasRes; x+=3) {
+                    const i = (y * CONFIG.canvasRes + x) * 4;
+                    const r = data[i];
+                    const g = data[i+1];
+                    const b = data[i+2];
+                    
+                    // Threshold brightness
+                    if (r + g + b > 40) {
+                        validPixels.push({
+                            // Mapping koordinat pixel ke Dunia 3D
+                            // X: -8 s/d 8, Y: -8 s/d 8
+                            x: (x / CONFIG.canvasRes - 0.5) * 16, 
+                            y: -(y / CONFIG.canvasRes - 0.5) * 16,
+                            color: useImageColor ? {r:r/255, g:g/255, b:b/255} : null
+                        });
+                    }
+                }
+            }
+
+            if (validPixels.length === 0) return;
+
+            const count = CONFIG.particleCount;
+            for(let i=0; i<count; i++) {
+                // Ambil pixel random dari yang valid
+                const p = validPixels[i % validPixels.length];
+                
+                targetPositions[i*3]   = p.x + (Math.random()-0.5)*0.1; // Sedikit jitter
+                targetPositions[i*3+1] = p.y + (Math.random()-0.5)*0.1;
+                targetPositions[i*3+2] = (Math.random()-0.5) * 0.5; // Z tipis (teks gepeng)
+
+                if (p.color) {
+                    targetColors[i*3] = p.color.r;
+                    targetColors[i*3+1] = p.color.g;
+                    targetColors[i*3+2] = p.color.b;
+                } else {
+                    setColorDefault(i);
+                }
+            }
+        }
+
+        function setColorDefault(i) {
+            targetColors[i*3] = CONFIG.baseColor.r;
+            targetColors[i*3+1] = CONFIG.baseColor.g;
+            targetColors[i*3+2] = CONFIG.baseColor.b;
+        }
+
+        // ============================================
+        // 3. ANIMATION LOOP (FISIKA & INTERAKSI)
+        // ============================================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 1. UPDATE BUFFER PARTIKEL (Interpolasi Posisi & Warna)
+            const posAttr = particleSystem.geometry.attributes.position;
+            const colAttr = particleSystem.geometry.attributes.color;
+
+            for(let i=0; i < CONFIG.particleCount; i++) {
+                const ix = i*3;
+                
+                // Posisi: Gerak halus ke target
+                positions[ix]   += (targetPositions[ix]   - positions[ix])   * CONFIG.morphSpeed;
+                positions[ix+1] += (targetPositions[ix+1] - positions[ix+1]) * CONFIG.morphSpeed;
+                positions[ix+2] += (targetPositions[ix+2] - positions[ix+2]) * CONFIG.morphSpeed;
+
+                // Warna: Gerak halus ke target
+                colors[ix]   += (targetColors[ix]   - colors[ix])   * 0.25;
+                colors[ix+1] += (targetColors[ix+1] - colors[ix+1]) * 0.25;
+                colors[ix+2] += (targetColors[ix+2] - colors[ix+2]) * 0.25;
+            }
+            posAttr.needsUpdate = true;
+            colAttr.needsUpdate = true;
+
+
+            // 2. INTERAKSI TANGAN (ZOOM & ROTATE)
+            let finalScale = 1.0;
+            let finalRotX = 0;
+            let finalRotY = 0;
+
+            if (isHandDetected && currentGesture !== -1) {
+                // Hanya di sini rotasi dikontrol tangan
+                finalRotY = (handCentroid.x - 0.5) * 1.6;
+                finalRotX = (handCentroid.y - 0.5) * 1.2;
+
+                if (currentGesture !== 0) {  // zoom kecuali fist
+                    const distNormalized = Math.max(0, Math.min(1, (smoothHandSize - 0.08) / 0.25));
+                    finalScale = CONFIG.zoomMin + (distNormalized * (CONFIG.zoomMax - CONFIG.zoomMin));
+                }
+            }
+            // Tidak ada else untuk rotasi otomatis → bola akan diam di idle
+
+            // Terapkan ke Object Container dengan Smooth Damping
+            particleSystem.rotation.x += (finalRotX - particleSystem.rotation.x) * 0.55;  // naik dari 0.1 → 0.18
+            particleSystem.rotation.y += (finalRotY - particleSystem.rotation.y) * 0.55;
+            
+            // Zoom smoothing
+            particleSystem.scale.setScalar(
+                THREE.MathUtils.lerp(particleSystem.scale.x, finalScale, 0.1)
+            );
+
+            renderer.render(scene, camera);
+        }
+
+        // ============================================
+        // 4. COMPUTER VISION (MEDIAPIPE)
+        // ============================================
+        function initCV() {
+            const videoEl = document.getElementById('input_video');
+            const canvasEl = document.getElementById('output_canvas');
+            const canvasCtx = canvasEl.getContext('2d');
+
+            const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+            
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+
+            hands.onResults(results => {
+                canvasCtx.clearRect(0,0, canvasEl.width, canvasEl.height);
+                canvasCtx.drawImage(results.image, 0, 0, canvasEl.width, canvasEl.height);
+
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    isHandDetected = true;
+                    const lm = results.multiHandLandmarks[0];
+
+                    // Debug Draw
+                    drawConnectors(canvasCtx, lm, HAND_CONNECTIONS, {color: '#00ffff', lineWidth: 2});
+                    drawLandmarks(canvasCtx, lm, {color: '#ffffff', lineWidth: 1, radius:3});
+
+                    // 1. Hitung Pusat Tangan (MCP Jari Tengah - Titik 9)
+                    handCentroid.x = 1.0 - lm[9].x; // Mirror X
+                    handCentroid.y = lm[9].y;
+
+                    // 2. Hitung Ukuran Tangan (Jarak Wrist ke Middle Finger Base)
+                    const w = lm[0];
+                    const m = lm[9];
+                    const rawSize = Math.sqrt(Math.pow(w.x - m.x, 2) + Math.pow(w.y - m.y, 2));
+                    
+                    // Smooth data ukuran tangan agar zoom tidak getar
+                    smoothHandSize += (rawSize - smoothHandSize) * 0.1;
+
+                    // 3. Hitung Jari
+                    const count = countFingers(lm);
+                    if (count !== currentGesture) {
+                        currentGesture = count;
+                        updateGestureState(count);
+                    }
+
+                } else {
+                    isHandDetected = false;
+                    if (currentGesture !== -1) {
+                        currentGesture = -1;
+                        updateGestureState(-1);
+                    }
+                }
+            });
+
+            const cameraUtils = new Camera(videoEl, {
+                onFrame: async () => await hands.send({image: videoEl}),
+                width: 320, height: 240
+            });
+            cameraUtils.start().then(() => {
+                loader.style.display = 'none';
+                statusTitle.textContent = "Sistem Siap";
+                statusDesc.textContent = "Gunakan gestur tangan Anda.";
+            });
+        }
+
+        function countFingers(lm) {
+            let f = 0;
+            // Thumb: Logic jarak Euclidean
+            if (dist(lm[4], lm[17]) > dist(lm[2], lm[17]) * 1.2) f++;
+            // Fingers: Logic Y Axis
+            if (lm[8].y < lm[6].y) f++;
+            if (lm[12].y < lm[10].y) f++;
+            if (lm[16].y < lm[14].y) f++;
+            if (lm[20].y < lm[18].y) f++;
+            return f;
+        }
+        function dist(a,b) { return Math.hypot(a.x-b.x, a.y-b.y); }
+
+        // ============================================
+        // 5. STATE MANAGER
+        // ============================================
+        function updateGestureState(gesture) {
+            // Selalu reset rotasi ke 0 setiap kali gestur berubah
+            // Ini memaksa bola & bentuk lain mulai dari posisi netral
+            if (gesture !== currentGesture) {
+                particleSystem.rotation.x = 0;
+                particleSystem.rotation.y = 0;
+                particleSystem.rotation.z = 0;
+            }
+
+            // Lalu update gestur seperti biasa
+            currentGesture = gesture;
+            switch(gesture) {
+                case -1: // No Hand
+                    statusTitle.textContent = "Mode Idle";
+                    statusDesc.textContent = "Partikel membentuk Bola";
+                    calculateSphereTarget();
+                    break;
+                case 0: // Fist
+                    statusTitle.textContent = "Genggaman (Fist)";
+                    statusDesc.textContent = "Partikel menyebar (Scatter)";
+                    calculateScatterTarget();
+                    break;
+                case 1:
+                    statusTitle.textContent = "1 Jari";
+                    statusDesc.textContent = "Huruf: I";
+                    calculateTextTarget("I", false);
+                    break;
+                case 2:
+                    statusTitle.textContent = "2 Jari";
+                    statusDesc.textContent = "Kata: Love";
+                    calculateTextTarget("Love", false);
+                    break;
+                case 3:
+                    statusTitle.textContent = "3 Jari";
+                    statusDesc.textContent = "Jurusan: Information Technology";
+                    calculateTextTarget("Information Technology", true); // True = Multiline
+                    break;
+                case 4:
+                    statusTitle.textContent = "4 Jari";
+                    statusDesc.textContent = "Kampus: Telkom University";
+                    calculateTextTarget("Telkom University", true); // True = Multiline
+                    break;
+                case 5:
+                    statusTitle.textContent = "5 Jari";
+                    statusDesc.textContent = "Menampilkan Logo...";
+                    calculateImageTarget(CONFIG.logoURL);
+                    break;
+            }
+        }
+
+        // START
+        initThree();
+        initCV();
+        animate();
+
+    </script>
+</body>
+</html>
